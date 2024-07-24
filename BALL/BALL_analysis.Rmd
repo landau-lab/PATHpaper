@@ -1,0 +1,984 @@
+---
+title: "Phylogenetic analysis uncovers B-cell acute lymphocytic leukemia (B-ALL) cell state heritability using single-cell whole-genome sequencing"
+author: Tamara Prieto
+date: May 14, 2024
+output:
+  pdf_document:
+   toc: true
+   toc_depth: 2
+---
+
+
+```{r, echo=F, message=F, warning=F}
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message = FALSE)
+library(dplyr)
+library(flowCore)
+library(ggcyto)
+library(forcats)
+library(ggtree)
+library(ape)
+library(stringr)
+library(ggplot2)
+library(tidyr)
+library(treeio)
+library(RColorBrewer)
+library(tibble)
+library(data.table)
+library(arules)
+library(ggnewscale)
+
+
+```
+
+
+# Processing of FACS data 
+
+```{r, eval=TRUE, message=FALSE}
+
+# Load and transform the FACS data 
+
+
+patient <- "4295"
+fs <- read.flowSet(path = paste0("facs/"), 
+                   truncate_max_range = FALSE,
+                   transformation=FALSE,
+                   # this word has to be contained in the filename to be read
+                   pattern = "fcs",  
+                   alter.names=TRUE)
+
+# compensate the data
+fs<- flowCore::compensate(fs, spillover = flowCore::spillover(fs[[1]])$SPILL)
+# Simplify marker names
+markernames(fs) <- newnames <- gsub(":.*","",markernames(fs))
+# logicle transform
+lgcl <- logicleTransform(w = 0.5, t = 262144,
+                         m = 4.5, a = 0)
+trans <- transformList(colnames(fs)[-1], lgcl)
+fs <- transform(fs, trans)
+
+
+# flowSet-specific iterator, fsApply, acts much like sapply or lapply 
+combined <- fsApply(fs, FUN = function(x){sample <- keyword(x)$GUID; exprs(x) %>%
+  as.data.frame %>% dplyr::mutate(Sample=sample)})
+combined_table <- do.call("rbind",combined)
+
+
+# Create a file with the index sorting information 
+phenotypes <- data.table::fread(
+  "facs/index_csv/4295_MRD_BALL_BMMNC_Blast-3_Index.csv") %>% 
+  dplyr::mutate(Patient="4295") %>%
+  dplyr::rename(cell_names=Cell_location)
+colnames(phenotypes) <- gsub(":.*","",colnames(phenotypes))
+
+saveRDS(object = phenotypes, 
+        file = "facs/FACS_metadata.rds") # equivalent to the object in the cluster
+
+phenotypes %>%
+  tidyr::pivot_longer(cols = colnames(phenotypes)[grepl(
+    "(-|CD)",colnames(phenotypes))]) %>%
+  dplyr::filter(!grepl("SC-",name)) %>%
+  ggplot(aes(value, group=name, fill=name)) +
+  geom_density(alpha=0.5) +
+  scale_x_continuous(trans = "log2") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(x="", y="", title = "", fill="Fluorescence\n(logicle transformed)")
+
+
+# Add index sorting information to the whole set 
+combined_table_withindex <- combined_table %>% 
+  dplyr::mutate(TIME=round(TIME, digits = 4)) %>%
+  dplyr::mutate(identifier="4295") %>%
+  dplyr::mutate(Patient=identifier) %>%
+  dplyr::full_join(phenotypes %>% dplyr::select(TIME,cell_names) %>% 
+                     dplyr::mutate(TIME=round(TIME, digits = 4))) %>%
+  dplyr::select(-Sample) %>%
+  dplyr::mutate(selected=ifelse(!is.na(cell_names),"Selected",NA))
+
+# rename marker names
+colnames(combined_table_withindex) <- plyr::mapvalues(
+  colnames(combined_table_withindex), 
+  names(markernames(fs)), 
+  to=paste0(markernames(fs),"-"))
+colnames(combined_table_withindex) <- gsub("\\.","-",colnames(combined_table_withindex))
+combined_table_withindex %>%
+  saveRDS(file = "facs/FACS_metadata_updated.rds")
+
+
+```
+
+# Annotation of the phylogenies with the FACS data
+
+```{r, eval=FALSE, message=FALSE}
+
+ObtainTreesWithAnnotations <- function(bootstrap_rep , normalize=F, tumoronly=T){
+            
+            # load the tree and prepare it 
+
+              if (bootstrap_rep==""){
+                # best tree made ultrametric 
+                tree_final  <- readRDS(
+                  file = paste0("ml_tree/TreeMutWithZeros.ultrametric.rds"))
+              } else {
+                bootstrap.tree.file=paste0("bootstrap_trees/TreeMutWithZeros.",
+                                           bootstrap_rep,".ultrametric.rds")
+                if (!file.exists(bootstrap.tree.file)) {
+                  return(NULL)
+                } else{
+                  tree_final  <- readRDS(file = bootstrap.tree.file)
+                }
+              }
+              
+              tree_final <- tree_final$fit$poisson_tree$nullmodel$ultratree
+              tree_final <- ape::makeNodeLabel(tree_final)
+              tree_final <- ape::drop.tip(tree_final,tip = "zeros")
+           
+            
+            if (isTRUE(tumoronly)) {
+                  # remove healthy samples and reroot 
+                  samplestoremove <- c("4295_D9","4295_C5", "4295_A11")
+                  tree_final <- ape::drop.tip(tree_final,tip = samplestoremove)
+                  suffix <- ".tumoronly" 
+                  # reroot the tree if we have removed the outgroup
+                  outgroup="4295_G8"
+                  # root the tree
+                  tree_final <- ape::root(tree_final,outgroup)
+            } else {
+                  outgroup="4295_A11"
+                  suffix <- ""
+                  # root the tree
+                  tree_final <- ape::root(tree_final,outgroup)
+            }
+          
+            # Add FACS phenotypes to the tree 
+            phenotypes_combined <- readRDS("facs/FACS_metadata_updated.rds") 
+            
+            # Create object with FACS indexed cells only: phenotypes_processed
+            phenotypes <- phenotypes_combined %>%
+              dplyr::filter(cell_names %in% gsub(".*_","",tree_final$tip.label))
+            phenotypes_processed <- phenotypes %>%
+              dplyr::mutate(cell_names=paste0("4295_",cell_names)) %>%
+              dplyr::select(-Patient)
+
+            
+            # Discretize CDs and add them as cds 
+
+            phenotypes_processed <- phenotypes_processed %>%
+            dplyr::mutate(across(matches("-"), 
+                                 ~ as.numeric(arules::discretize(.x,
+                                 method = "frequency", 
+                                 breaks = 6, labels=c(1,2,3,4,5,6))),
+                                 .names = "discr_{.col}"
+                                 ))
+            # rename columns for discretized values
+            colnames(phenotypes_processed) <- gsub("discr_SSC","d.ssc",
+                                                   gsub("discr_FSC","d.fsc",
+                                                   gsub("discr_CD","d.cd",
+                                                   colnames(phenotypes_processed))))
+            
+            # Save the nonnormalized matrix in case we decide to plot this one
+            phenotypes_processed_nonnorm <- phenotypes_processed
+            
+            phenotypes_processed <- do.call(cbind.data.frame,lapply(phenotypes_processed, 
+              FUN = function(x){
+                if ((is.numeric(x) & !is.integer(x))) {
+                  out = (x-min(x))/(max(x)-min(x))
+                } else{
+                  out=x
+                } 
+                return(out)
+              }))
+            
+            
+            if (!isTRUE(normalize)){
+              phenotypes_processed <- phenotypes_processed_nonnorm 
+            }
+          
+              # Create a VAF file from the exome
+              alleliccounts <- fread(paste0("exome/AllelicCounts.4295.txt"), 
+                           col.names = c("chrom","pos","ref","alt","REF","ALT","name"))
+              bed <- fread(paste0("exome/4295_SNP_filtered.bed"), 
+                           col.names = c("chrom","start","pos","gene","vartype")) %>%
+                dplyr::select(-start)
+              VAF_genesinterest2 <- alleliccounts %>%
+                dplyr::left_join(bed) %>%
+                dplyr::filter(vartype!="indel") %>%
+                dplyr::mutate("CHROM:POS"=paste(chrom,pos,sep=":")) %>%
+                dplyr::mutate(cov=as.numeric(ref+alt)) %>%
+                dplyr::mutate(vaf=as.numeric(alt/(ref+alt))) %>%
+                dplyr::select(`CHROM:POS`,name,ref,alt,cov,vaf,REF,ALT,gene) %>%
+                dplyr::select(-ref,-alt,-cov) %>%
+                dplyr::select(-REF,-ALT) %>%
+                tidyr::pivot_wider(names_from=name,values_from = vaf) %>%
+                # add a counter to each gene (same gene with several mutations)
+                group_by(gene) %>% mutate(counter = row_number(gene)) %>%
+                dplyr::ungroup() %>%   dplyr::mutate(
+                  gene=ifelse(!is.na(gene),paste(gene,counter,sep="."),NA)) %>%
+                dplyr::select(-`CHROM:POS`,-counter) %>%
+                dplyr::mutate(gene=gsub(".1$","",gene)) %>%
+                dplyr::mutate(gene=paste0("G-",gene,sep="")) %>%
+                tibble::column_to_rownames("gene") %>%
+                t() %>% as.data.frame() %>%
+                tibble::rownames_to_column("cell_names")
+              # Order matrix as if it was a heatmap
+              VAF_genesinterest3 <- VAF_genesinterest2[,-1]
+              VAF_genesinterest3[is.na(VAF_genesinterest3)] <- 0 
+              ordercols <- hclust(dist(t(VAF_genesinterest3), method = "manhattan"))
+              VAF_genesinterest2 <- VAF_genesinterest2[,c(1,rev(ordercols$order)+1)]
+
+             
+            # Mutation profile from treemut
+            treemut_tree  <- readRDS(file = paste0("exome/TreeMut.exome.rds"))
+            mutationinfo <- treemut_tree@data %>%
+              dplyr::select(profile.x,mut_count,mutList2) %>%
+              dplyr::mutate(profile=profile.x) %>%
+              dplyr::mutate(mutList=mutList2) %>%
+              arrange(mut_count) %>%
+              dplyr::filter(mut_count>1)
+            Mutations_mapped <- mutationinfo %>%
+              dplyr::select(profile,mutList) %>%
+              dplyr::mutate(numgenes=stringr::str_count(mutList, pattern = ",")) %>%
+              dplyr::mutate(numgenes=ifelse(nchar(mutList)>4, numgenes+1,numgenes)) %>%
+              dplyr::filter(nchar(mutList)>4) %>%
+              # separate genes into independent colums
+              tidyr::separate_rows(mutList, sep=",") %>%
+              dplyr::mutate(mutList=paste0(mutList, " (mapped)")) %>%
+              # for some reason the first column ends up being empty
+              tidyr::separate(col=profile, into=c("extra",
+                                                  treemut_tree@phylo$tip.label), 
+                              sep = "", convert=TRUE) %>%
+              dplyr::select(-extra) %>%
+              dplyr::select(-numgenes) %>%
+              tibble::column_to_rownames("mutList") %>%
+              t() %>% as.data.frame() %>%
+              tibble::rownames_to_column("cell_names")
+          
+          
+              # Add Allelic imbalance regions
+              # Add short version for the autocorrelation
+              ai_events <- read.table("CNVs/CNVs.collapsedtp.tsv") %>%
+                dplyr::mutate(start=format(start, scientific = FALSE)) %>%
+                dplyr::mutate(end=format(end, scientific = FALSE)) %>%
+                dplyr::mutate(id=gsub(" ","",paste0(chrom,":",
+                                                    as.character(start),"-",
+                                                    as.character(end)))) %>%
+                dplyr::select(-ID,-chrom,-start,-end,
+                              -name,-gieStain,-span_kb,-filt,-span_next) %>%
+                as.data.frame()
+              ai_events2 = data.frame(t(ai_events[,-ncol(ai_events)]))
+              colnames(ai_events2) <- ai_events$id
+              ai_events <- ai_events2 %>%
+                tibble::rownames_to_column("cell_names") %>%
+                dplyr::mutate(cell_names=paste0("4295_",gsub("_1","",cell_names)))
+
+              # Add long version to the plot
+              ai_events_ext <- read.table(
+                "CNVs/CNVs.collapsedbycytogeneticbandtp.tsv") %>%
+                dplyr::mutate(id=gsub(" ","",paste0(chrom,".",as.character(name)))) %>%
+                dplyr::select(-chrom,-start_band,-end_band,-name,-gieStain) %>%
+                as.data.frame()
+              ai_events2 = data.frame(t(ai_events_ext[,-ncol(ai_events_ext)]))
+              colnames(ai_events2) <- ai_events_ext$id
+              ai_events_ext <- ai_events2 %>%
+                tibble::rownames_to_column("cell_names") %>%
+                dplyr::mutate(cell_names=paste0("4295_",gsub("_1","",cell_names)))
+      
+              phenotypes_processed <- dplyr::full_join(phenotypes_processed,ai_events_ext)
+
+            # Combine all phenotypes into a single table
+            phenotypes_processed <- phenotypes_processed %>%
+              dplyr::filter(!is.na(TIME)) %>%
+              #dplyr::full_join(singlecheck) %>%
+              dplyr::left_join(VAF_genesinterest2) %>%
+              dplyr::left_join(Mutations_mapped) %>%
+              tibble::column_to_rownames(var = "cell_names") 
+            
+
+            # Create a combined object and save it
+            mytreedata <- left_join(as_tibble(tree_final),
+                                    phenotypes_processed %>% 
+                                    tibble::rownames_to_column(var = "label"), 
+                                    by = 'label') %>%
+              treeio::as.treedata()
+          
+            saveRDS(mytreedata, 
+                    file = paste0("annotated_trees/Tree.annotated",
+                                  suffix,bootstrap_rep,".rds",sep=""))
+
+}
+
+# Only tumor cells (ML tree)
+ObtainTreesWithAnnotations(normalize = F, tumoronly=T, bootstrap_rep="")
+
+# Bootstrap replicates
+bootstrps <- seq(1,1000)
+lapply(X = bootstrps, FUN = ObtainTreesWithAnnotations, normalize = F, tumoronly=T)
+
+```
+
+
+# Calculate phylogenetic autocorrelation and crosscorrelation
+
+```{r, eval=F}
+
+library(corrplot)
+library(RColorBrewer)
+library(forcats)
+library(ggplot2)
+library(dplyr)
+library(castor)
+library(qlcMatrix)
+library(PATH)
+
+state2mat.char <- function(states, prefix="state") {
+  st <- as.numeric(as.factor(states))
+  nms <- levels(as.factor(states))
+  n <- length(nms)
+  j <- matrix(0, length(st), n)
+  colnames(j) <- paste(prefix,nms,sep="_")
+  for(k in 1:n) {
+    j[which(st==k),k] <- 1
+  }
+  return(j)
+}
+
+
+CalculatePhylogeneticCorrelations <- function(bootstrap.rep, tumoronly=T) {
+
+    if (isTRUE(tumoronly)){
+      suffix=".tumoronly"
+    } else {
+      suffix=""
+    }
+
+  treefile=paste("annotated_trees/Tree.annotated",suffix,bootstrap.rep,".rds",sep="")
+  if (!file.exists(treefile)) {
+    return(NULL)
+  } else {
+    tree <- readRDS(file = treefile)
+    tree %>% as_tibble()%>% write.table(file=paste0(
+      "phylo_corr/PhenotypeTable",bootstrap.rep,".csv"), 
+      quote = F,sep = "\t" )
+  }
+    
+    # CONTINUOUS
+      numeric_columns <- colnames(tree@data)[which(unlist(
+        lapply(tree@data, is.numeric)) & 
+          grepl("-|\\.|(mapped)|TIME",colnames(tree@data)))]
+    continuous_data <- tree@data[1:length(tree@phylo$tip.label),numeric_columns]
+    
+    # DISCRETE
+    character_columns <- colnames(tree@data)[which(unlist(
+      lapply(tree@data, is.character)))]
+    SeparateCharacterLevels  <- function(x){
+      mystates <- unlist(tree@data[1:length(tree@phylo$tip.label),
+                                   character_columns[x]])
+      if (sum(is.na(mystates))==length(mystates)){
+        mycol <- cbind(rep(NA,length(mystates)))
+        colnames(mycol)[1] <- character_columns[x]
+        return(mycol)
+      } else {
+      cols <- state2mat.char(states = mystates, prefix=character_columns[x])
+      return(cols)}
+    }
+    discrete_data <- do.call("cbind.data.frame",lapply(1:length(character_columns),
+                                                       SeparateCharacterLevels))
+    all_data <- cbind.data.frame(continuous_data,discrete_data)
+    # Remove columns which are all NA
+    all_data <- Filter(function(x)!all(is.na(x)), all_data)
+    
+    crosscorr <- PATH::xcor(weight.matrix = PATH::inv.tree.dist(tree@phylo), 
+                            data=all_data %>% as.matrix())
+    
+    crosscorr$one.sided.pvalue <- crosscorr$one.sided.pvalue[,!colSums(
+      is.na(crosscorr$Morans.I))==nrow(crosscorr$Morans.I)]
+    crosscorr$one.sided.pvalue <- crosscorr$one.sided.pvalue[!rowSums(
+      is.nan(crosscorr$one.sided.pvalue))>0,]
+    dim(crosscorr$one.sided.pvalue)
+    crosscorr$Morans.I <- crosscorr$Morans.I[,!colSums(
+      is.na(crosscorr$Morans.I))==nrow(crosscorr$Morans.I)]
+    crosscorr$Morans.I <- crosscorr$Morans.I[!rowSums(
+      is.nan(crosscorr$Morans.I))>0,]
+    dim(crosscorr$Morans.I)
+    crosscorr$Z.score <- crosscorr$Z.score[,!colSums(
+      is.na(crosscorr$Z.score))==nrow(crosscorr$Z.score)]
+    crosscorr$Z.score <- crosscorr$Z.score[!rowSums(
+      is.nan(crosscorr$Z.score))>0,]
+    dim(crosscorr$Z.score)
+    
+    colnames(crosscorr$Morans.I) <- gsub("^(G)-","",gsub(
+      "-$","",colnames(crosscorr$Morans.I)))
+    rownames(crosscorr$Morans.I) <- gsub("^(G)-","",gsub(
+      "-$","",rownames(crosscorr$Morans.I)))
+    colnames(crosscorr$one.sided.pvalue) <- gsub("^(G)-","",gsub(
+      "-$","",colnames(crosscorr$one.sided.pvalue)))
+    rownames(crosscorr$one.sided.pvalue) <- gsub("(^G)-","",gsub(
+      "-$","",rownames(crosscorr$one.sided.pvalue)))
+    colnames(crosscorr$Z.score) <- gsub("(^G)-","",gsub(
+      "-$","",colnames(crosscorr$Z.score)))
+    rownames(crosscorr$Z.score) <- gsub("(^G)-","",gsub(
+      "-$","",rownames(crosscorr$Z.score)))
+    
+
+    saveRDS(object = crosscorr, 
+            file = paste0("phylo_corr/Crosscor",suffix,
+                          bootstrap.rep,".rds",sep=""))
+    
+}
+
+
+CalculatePhylogeneticCorrelations(tumoronly = F, bootstrap.rep = "")
+bootstrps <- seq(1,1000)
+lapply(c("",bootstrps), CalculatePhylogeneticCorrelations, tumoronly=T)
+CalculatePhylogeneticCorrelations(tumoronly = T, bootstrap.rep = "")
+
+```
+
+
+# Plot 5.A
+
+```{r  message=FALSE}
+library(tibble)
+library(treeio)
+library(dplyr)
+library(ggnewscale)
+library(ggplot2)
+library(ggtree)
+library(PATH)
+library(pheatmap)
+
+
+
+# Load treemut tree (actual lengths) 
+tree <- readRDS(file = "annotated_trees/Tree.annotated.tumoronly.rds")
+
+phenotypes_processed <- tree@data %>%
+  dplyr::left_join(tree %>% as_tibble()) %>%
+  dplyr::mutate(label=gsub(".*_","",label)) %>%
+  tibble::column_to_rownames("label")
+
+
+
+layout_tree <- "rectangular"
+tree2plot <- tree
+tree2plot@phylo$tip.label <- gsub(".*_","",tree2plot@phylo$tip.label)
+treefigure <- ggtree(tree2plot, layout = layout_tree) + 
+  geom_tiplab(size=2.5,angle=90,hjust=1.2, fontface=2) +
+  xlim(0,1500) +
+  scale_color_distiller(type = "seq",
+                        direction = 1,
+                        palette = "Blues") +
+  layout_dendrogram() + # vertical display
+  labs(x="",color  = "Local\nbranching index", shape = "") +
+  theme(legend.position = "right")   # bottom to top
+
+
+
+####### Plot SNVs on the tree       
+# Create a table with all values of VAF to use it to sort the columns
+gene_vars <- c("G-JAK2","G-JAK2.2")
+gene_vars <- c("G-JAK2.2")
+SNVs <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>% 
+  dplyr::select(gene_vars)
+colnames(SNVs) <- gsub("JAK2$","JAK2 R683S",gsub("\\.2"," R683G",
+         gsub("G-","",colnames(SNVs))))
+
+
+Plot1 <- gheatmap(treefigure, SNVs,
+                  offset=2.8, # distance from tips to the matrix
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  hjust = 0, # centering colnames
+                  colnames_offset_y = -15,
+                  colnames_position = "bottom",
+                  font.size = 7, # matrix colnames
+                  color="lightgrey", # color of cell border
+                  legend_title="",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "grey",mid="white", 
+                       high = "darkolivegreen3", 
+                       na.value = "lightgrey") +
+  labs(fill="VAF ") +
+  theme(legend.position = "bottom")
+
+
+
+# Add CNVs
+
+newColorPlot1 <-Plot1 + ggnewscale::new_scale_fill()
+
+
+#cnv_vars <- c("chr16.p13.13","chr6.q16.3")
+cnv_vars <- c("chr6.q22.1")
+CNVs <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>% dplyr::select(cnv_vars)
+
+
+Plot2 <- gheatmap(newColorPlot1, CNVs,
+                  offset=4.0, # distance from tips to the matrix
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  hjust = 0, # centering colnames
+                  colnames_offset_y = -17,
+                  colnames_position = "bottom",
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "grey",mid="white", 
+                       high = "salmon1", 
+                       na.value = "lightgrey") +
+  labs(fill="Allelic\nimbalance ") +
+  theme(legend.position = "bottom")
+
+
+
+colnames(phenotypes_processed) <- gsub("-$","",colnames(phenotypes_processed))
+
+
+# phenotypic factors separated CD34
+newColorPlot2 <-Plot2 + new_scale_fill()
+A_vars <- c("d.cd34")
+FACSmarkers <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>%
+  dplyr::select(A_vars) 
+colnames(FACSmarkers) <- gsub("d.cd","CD",colnames(FACSmarkers))
+Plot3 <- gheatmap(newColorPlot2, FACSmarkers ,
+                  offset=6,
+                  #offset=350, # distance from tips to the matrix
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  colnames_position = "bottom",
+                  hjust = -1, # centering colnames
+                  colnames_offset_y = -14,
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "brown",mid="lightblue", 
+                       high = "goldenrod1", na.value = "lightgrey", midpoint = 3.5) +
+  scale_fill_gradient2(low = "goldenrod1",mid="lightblue", 
+                       high = "brown", na.value = "lightgrey", midpoint = 3.5) +
+  labs(fill="Transformed\nfluorescence ") +
+  theme(legend.position = "bottom")
+
+
+# phenotypic factors separated CD38
+newColorPlot3 <-Plot3 + new_scale_fill()
+A_vars <- c("d.cd38")
+FACSmarkers <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>%
+  dplyr::select(A_vars) 
+colnames(FACSmarkers) <- gsub("d.cd","CD",colnames(FACSmarkers))
+Plot4 <- gheatmap(newColorPlot3, FACSmarkers ,
+                  offset=7,
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  colnames_position = "bottom",
+                  hjust = -1, # centering colnames
+                  colnames_offset_y = -14,
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "brown",mid="lightblue", 
+                       high = "goldenrod1", na.value = "lightgrey", midpoint = 3.5) +
+  scale_fill_gradient2(low = "goldenrod1",mid="lightblue", 
+                       high = "brown", na.value = "lightgrey", midpoint = 3.5) +
+  labs(fill="Transformed\nfluorescence ") +
+  theme(legend.position = "bottom")
+
+
+# phenotypic factors separated CD10
+newColorPlot4 <-Plot4 + new_scale_fill()
+A_vars <- c("d.cd10")
+FACSmarkers <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>%
+  dplyr::select(A_vars)
+colnames(FACSmarkers) <- gsub("d.cd","CD",colnames(FACSmarkers))
+Plot5 <- gheatmap(newColorPlot4, FACSmarkers,
+                  offset=8,
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  colnames_position = "bottom",
+                  hjust = -1, # centering colnames
+                  colnames_offset_y = -14,
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "brown",mid="lightblue", 
+                       high = "goldenrod1", na.value = "lightgrey", midpoint = 3.5) +
+  scale_fill_gradient2(low = "goldenrod1",mid="lightblue", 
+                       high = "brown", na.value = "lightgrey", midpoint = 3.5) +
+  labs(fill="Transformed\nfluorescence ") +
+  theme(legend.position = "bottom")
+
+
+# phenotypic factors separated CD19
+newColorPlot5 <-Plot5 + new_scale_fill()
+A_vars <- c("d.cd19")
+FACSmarkers <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>%
+  dplyr::select(A_vars) 
+colnames(FACSmarkers) <- gsub("d.cd","CD",colnames(FACSmarkers))
+Plot6 <- gheatmap(newColorPlot5, FACSmarkers,
+                  offset=9,
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  colnames_position = "bottom",
+                  hjust = -1, # centering colnames
+                  colnames_offset_y = -14,
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "brown",mid="lightblue", 
+                       high = "goldenrod1", na.value = "lightgrey", midpoint = 3.5) +
+  scale_fill_gradient2(low = "goldenrod1",mid="lightblue", 
+                       high = "brown", na.value = "lightgrey", midpoint = 3.5) +
+  labs(fill="Transformed\nfluorescence ") +
+  theme(legend.position = "bottom")
+
+
+# phenotypic factors separated CD20
+newColorPlot6 <-Plot6 + new_scale_fill()
+A_vars <- c("d.cd20")
+FACSmarkers <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>%
+  dplyr::select(A_vars)
+colnames(FACSmarkers) <- gsub("d.cd","CD",colnames(FACSmarkers))
+Plot7 <- gheatmap(newColorPlot6, FACSmarkers,
+                  offset=10 ,
+                  #offset=350, # distance from tips to the matrix
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  colnames_position = "bottom",
+                  hjust = -1, # centering colnames
+                  colnames_offset_y = -14,
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "brown",mid="lightblue", 
+                       high = "goldenrod1", na.value = "lightgrey", midpoint = 3.5) +
+  scale_fill_gradient2(low = "goldenrod1",mid="lightblue", 
+                       high = "brown", na.value = "lightgrey", midpoint = 3.5) +
+  labs(fill="Transformed\nfluorescence ") +
+  theme(legend.position = "bottom")
+
+
+# phenotypic factors separated CD45
+newColorPlot7 <-Plot7 + new_scale_fill()
+A_vars <- c("d.cd45")
+FACSmarkers <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>%
+  dplyr::select(A_vars)
+colnames(FACSmarkers) <- gsub("d.cd","CD",colnames(FACSmarkers))
+Plot8 <- gheatmap(newColorPlot7, FACSmarkers,
+                  offset=11 ,
+                  #offset=350, # distance from tips to the matrix
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  colnames_position = "bottom",
+                  hjust = -1, # centering colnames
+                  colnames_offset_y = -14,
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "brown",mid="lightblue", 
+                       high = "goldenrod1", na.value = "lightgrey", midpoint = 3.5) +
+  scale_fill_gradient2(low = "goldenrod1",mid="lightblue", 
+                       high = "brown", na.value = "lightgrey", midpoint = 3.5) +
+  labs(fill="Transformed\nfluorescence ") +
+  theme(legend.position = "bottom")
+
+
+
+### random factors
+
+# combine numeric and character types
+newColorPlot8 <-Plot8 + new_scale_fill()
+neg_control <- c("TIME")
+negcontrol <- phenotypes_processed[1:length(tree@phylo$tip.label),] %>% 
+  dplyr::select(all_of(neg_control))
+colnames(negcontrol) <- gsub("TIME","Sorting time",colnames(negcontrol))
+Plot9 <- gheatmap(newColorPlot8, negcontrol ,
+                  offset=13, # distance from tips to the matrix
+                  width=0.05, # default 1
+                  colnames_angle=0, 
+                  colnames_position = "bottom",
+                  hjust = 0, # centering colnames
+                  colnames_offset_y = -16,
+                  font.size = 7, # matrix colnames
+                  color="lightgrey",
+                  colnames=T
+) +
+  scale_fill_gradient2(low = "white",mid="lightgrey", 
+                       high = "black", na.value = "lightgrey", 
+                       midpoint = mean(negcontrol$`Sorting time`)) +
+  labs(fill="Sorting time\n(in seconds) ") +
+  theme(legend.position = "bottom")
+
+# vexpand allows to increase the y axis limits to fit column names
+Plot10 <- Plot9 + vexpand(.01, direction = -1) +
+       vexpand(.04, direction = 1)  +
+         theme(legend.position = "bottom", 
+               legend.key.size = unit(0.6, 'cm'), 
+               legend.text = element_text(size=8, angle=45,hjust = 1))
+
+ggsave(plot = Plot10,filename = "plots/TreeAnnotated.onlytumor.pdf", 
+       width = 12, height = 10)
+
+```
+
+
+# Plot 5B
+
+```{r 5B,  message=FALSE}
+
+CombineAllMoranBootstrap <- function(bootstrap.rep){
+
+  crosscor_file=paste0("phylo_corr/Crosscor.tumoronly",bootstrap.rep,".rds",sep="")
+    if (!file.exists(crosscor_file)) {
+      return(NULL)
+    } else {
+    
+        crosscorr<- readRDS(file = crosscor_file)
+        
+        # barplot with phylogenetic correlation
+        morans=diag(crosscorr$Morans.I)
+        names(morans) <- colnames(crosscorr$Morans.I)
+        zscore=diag(crosscorr$Z.score)
+        names(zscore) <- colnames(crosscorr$Morans.I)
+        pval=diag(crosscorr$one.sided.pvalue)
+        names(pval) <- colnames(crosscorr$Morans.I)
+        histogram_heritable <- cbind(morans,zscore,pval) %>%
+          as.data.frame() %>%
+          arrange(-zscore) %>%
+          dplyr::mutate(test=ifelse(as.numeric(pval)<0.05,
+                                    "significant","non significant")) %>%
+          tibble::rownames_to_column(var = "phenotype") %>%
+          dplyr::mutate(phenotype=gsub(",.*","",phenotype)) %>%
+          dplyr::mutate(phenotype=gsub("TIME","Sorting time",phenotype)) %>%
+          dplyr::filter(!grepl("CD",phenotype)) %>%
+          dplyr::mutate(phenotype_group=ifelse(grepl("^chr",phenotype),
+                        "Genetic-cnv",ifelse(grepl("(-|CD|cd)",phenotype),
+                        "Phenotypic",ifelse(grepl("Sorting time",phenotype),
+                         "Negative\ncontrol","Genetic-snv")))) %>%
+          dplyr::mutate(phenotype_group2=gsub("-.*","",phenotype_group)) %>%
+          dplyr::mutate(phenotype=gsub("d.cd","CD",phenotype)) %>%
+          dplyr::mutate(phenotype=gsub("\\.2"," R683G",phenotype)) %>%
+          dplyr::mutate(phenotype = forcats::fct_reorder(phenotype, -zscore)) %>%
+          dplyr::mutate(phenotype_group2 = forcats::fct_reorder(
+            phenotype_group2, -zscore)) %>%
+          dplyr::mutate(bootstrap=bootstrap.rep)
+        
+          return(histogram_heritable)
+    }
+  
+}  
+  
+bootstrps <- seq(1,527) # some tree calibration failed
+morancorrelation_longtable <- do.call("rbind",lapply(
+  bootstrps,CombineAllMoranBootstrap))
+  
+phenotypes_of_interest <- c("JAK2 R683G","chr6.q22.1","CD34",
+                            "CD10","CD20","CD19","CD45","CD38",
+                            "d.cd34","d.cd10","d.cd20",
+                            "d.cd19","d.cd45","d.cd38","Sorting time")
+
+morancorrelation_longtable %>%
+  dplyr::filter(phenotype %in% phenotypes_of_interest) %>%
+  dplyr::mutate(phenotype=factor(phenotype,levels = c("JAK2 R683G","chr6.q22.1",
+                                                      "CD34","CD45","CD19",
+                                                      "CD20","CD38","CD10",
+                                                      "Sorting time"))) %>%
+  ggplot(aes(x=phenotype,y=zscore,fill=phenotype_group, 
+             col=as.factor(phenotype_group))) +
+  geom_jitter(aes(alpha=test,fill=phenotype_group),size=0.5) +
+  geom_boxplot(col="black", outlier.shape = NA) +
+  theme_classic() +
+  theme(strip.text.x = element_text(size=6),
+        strip.background = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, 
+                                   vjust = 0.5, size=12), 
+        legend.position = "none") +
+  labs(y="Phylogenetic auto-correlation\n(zscore)",x="",
+       fill="",alpha="adj. p-value",) +
+  scale_fill_manual(values = c("salmon1","darkolivegreen3","grey","goldenrod1")) +
+  scale_color_manual(values = c("salmon1","darkolivegreen3","grey","goldenrod1")) +
+  facet_grid(. ~ phenotype_group2, scales = "free_x", space = "free") #+
+ggsave(file = paste(
+  "plots/HeretabilityPhenotypesBoxplotBootstrapReplicates.tumoronly.pdf",sep=""), 
+       height = 5, width = 4, dpi = 300)  
+
+```
+
+
+# Plot 5C
+
+```{r}
+
+library(wesanderson)
+
+  crosscorr <-  readRDS(file = paste0("phylo_corr/Crosscor.tumoronly.rds",sep=""))
+  phenotypes_of_interest <- c("chr16.p13.13","JAK2.2","CD34",
+                              "CD10","CD20","CD19","CD45","CD38",
+                              "d.cd34","d.cd10","d.cd20",
+                              "d.cd19","d.cd45","d.cd38","TIME")
+
+pal <- wes_palette("Darjeeling2", 4, type = "discrete")
+# barplot with phylogenetic correlation
+morans=diag(crosscorr$Morans.I)
+names(morans) <- colnames(crosscorr$Morans.I)
+zscore=diag(crosscorr$Z.score)
+names(zscore) <- colnames(crosscorr$Morans.I)
+pval=diag(crosscorr$one.sided.pvalue)
+names(pval) <- colnames(crosscorr$Morans.I)
+
+# Remove whole row and column when the phenotype is not significantly heritable
+# and positive
+pvalue_cutoff <- 0.05
+heritable_characters <- names(which(diag(
+  as.matrix(crosscorr$one.sided.pvalue))<pvalue_cutoff & 
+    diag(as.matrix(crosscorr$Morans.I))>0))
+# I have added it for the analysis of the three patients
+phenotypes_of_interest <- names(which(diag(
+  as.matrix(crosscorr$one.sided.pvalue))<pvalue_cutoff & 
+    diag(as.matrix(crosscorr$Morans.I))>0))
+
+# Select only the phenotypes of interest
+crosscorr$one.sided.pvalue <- crosscorr$one.sided.pvalue[phenotypes_of_interest,
+                                                         phenotypes_of_interest]
+crosscorr$Morans.I <- crosscorr$Morans.I[phenotypes_of_interest,
+                                         phenotypes_of_interest]
+
+df<- reshape2::melt(crosscorr$Z.score[c("d.cd34","d.cd19",
+                                        "d.cd20","d.cd45"),
+                                      c("d.cd34","d.cd19","d.cd20","d.cd45")],
+                      value.name="Phylogenetic correlation")
+df %>% 
+  dplyr::mutate(Var1=gsub("d.cd","CD",Var1)) %>%
+  dplyr::mutate(Var2=gsub("d.cd","CD",Var2)) %>%
+  dplyr::mutate(Var2=factor(as.factor(Var2),
+                            levels=c("CD34","CD19","CD20","CD45"))) %>%
+  dplyr::mutate(Var1=factor(as.factor(Var1),
+                            levels=c("CD34","CD19","CD20","CD45"))) %>%
+  ggplot(aes(x=Var1, y=fct_rev(Var2), fill=`Phylogenetic correlation`)) +
+  geom_tile() +
+  scale_fill_distiller(palette = 5, type = "div") + 
+  ggpubr::theme_pubclean(base_size = 15) +
+  theme(aspect.ratio = 1) +
+  labs(x="",y="",fill="Phylogenetic correlation\nz score")
+ggsave(filename = paste("plots//PhylogeneticCorrelation.heatmap.tumoronly.pdf",sep=""), 
+       dpi = 300)
+
+```  
+
+# Plot 5D
+
+```{r}
+
+
+CombineAllCrosscorrBootstrap <- function(bootstrap.rep){
+  
+  crosscor_file=paste0("phylo_corr/Crosscor.tumoronly",bootstrap.rep,".rds",sep="")
+  if (!file.exists(crosscor_file)) {
+    return(NULL)
+  } else {
+    
+    crosscorr<- readRDS(file = crosscor_file)
+    
+    zscore.CD34 <- crosscorr$Z.score[c("CD34"),]
+    out <- cbind(zscore.CD34) %>% as.data.frame()%>%
+      tibble::rownames_to_column("feature") %>%
+      dplyr::filter(grepl("^chr",feature)) %>%
+      dplyr::filter(!grepl("mapped",feature)) %>%
+      dplyr::mutate(feature = forcats::fct_reorder(feature, -zscore.CD34)) %>%
+      dplyr::mutate(event=ifelse(grepl(
+        "(^chr6.q2|chr6.q16|chr6.p22)",feature),"Selected",NA)) %>%
+      dplyr::mutate(bootstrap=bootstrap.rep)
+    
+    return(out)
+  }
+  
+}  
+
+bootstrps <- seq(1,527)
+crosscorrelation_longtable <- do.call("rbind",
+                                      lapply(bootstrps,
+                                             CombineAllCrosscorrBootstrap))
+
+
+
+crosscorrelation_longtable %>%
+  ggplot(aes(feature,zscore.CD34,fill=event)) +
+  geom_jitter(aes(col=event), size=0.5) +
+  geom_boxplot(outlier.shape = NA) +
+  coord_flip() +
+  geom_hline(yintercept=2, linetype="dashed", 
+             color = "black", size=0.5) +
+  geom_hline(yintercept=-2, linetype="dashed", 
+             color = "black", size=0.5) +
+  theme_bw() +
+  scale_fill_manual(values=c("orchid4","grey20"), na.value = "grey90") +
+  scale_color_manual(values=c("orchid4","grey20"), na.value = "grey90") +
+  theme(legend.position = "none", axis.text.y = element_text(size=14), 
+        axis.title = element_text(size=16)) +
+  ylim(-11,11) +
+  labs(x="LOH events\n(by chromosome band)",y="Phylogenetic cross-correlation\nwith CD34")
+
+ggsave(filename = paste0("plots/CrossCorrelationCD34CNVsBoxplot.pdf",sep=""), 
+       width = 6, height = 7)
+
+
+```
+
+
+```{r, echo=F, eval=FALSE}
+
+# Analyze heritability within each subclone
+
+tree <- readRDS(file = "annotated_trees/Tree.annotated.tumoronly.rds")
+
+cells_no_deletion <- tree %>% as_tibble() %>%
+  dplyr::filter(`chr6.q22.1`<0.25) %>%
+  dplyr::select(label) %>%
+  unlist() %>%
+  as.vector() %>% sort()
+
+cells_deletion <- tree %>% as_tibble() %>%
+  dplyr::filter(`chr6.q22.1`>=0.25) %>%
+  dplyr::select(label) %>%
+  unlist() %>%
+  as.vector() %>% sort()
+
+chr6del_clone <- treeio::drop.tip(tree, cells_no_deletion)
+nochr6del_cells <- treeio::drop.tip(tree, cells_deletion)
+
+# SUBTREE WITH DEL
+    my_data_interest <- chr6del_clone@data[1:length(chr6del_clone@phylo$tip.label),
+                                           "d.cd34-"]
+    crosscorr <- PATH::xcor(weight.matrix = PATH::inv.tree.dist(chr6del_clone@phylo), 
+                            data=my_data_interest %>% as.matrix())
+    crosscorr$Z.score
+    crosscorr$one.sided.pvalue
+    
+# SUBTREE WITH NO DEL
+    my_data_interest <- nochr6del_cells@data[1:length(
+      nochr6del_cells@phylo$tip.label),"d.cd34-"]
+    crosscorr <- PATH::xcor(weight.matrix = PATH::inv.tree.dist(
+      nochr6del_cells@phylo), data=my_data_interest %>% as.matrix())
+    crosscorr$Z.score
+    crosscorr$one.sided.pvalue
+
+
+# WHOLE TREE
+    my_data_interest <- tree@data[1:length(tree@phylo$tip.label),"d.cd34-"]
+    crosscorr <- PATH::xcor(weight.matrix = PATH::inv.tree.dist(tree@phylo), 
+                            data=my_data_interest %>% as.matrix())
+    crosscorr$Z.score
+    crosscorr$one.sided.pvalue
+
+
+
+```
+
+
