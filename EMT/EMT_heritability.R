@@ -1,6 +1,6 @@
 # EMT heritability and plasticity in a mouse model of PDAC
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 # Mouse 1 Clone 1 from Simeonov et al. 2021.
 mouse1cl1 <- cleanup_EMT_tree(readRDS("EMTtrees/Mouse1.Clone1.extended.rds"))

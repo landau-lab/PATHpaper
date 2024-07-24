@@ -1,6 +1,6 @@
 # PATHpro inference on composite EMT phylogeny
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 # Load clonal phylogenies
 supertree_files <- lapply(grep("extended",

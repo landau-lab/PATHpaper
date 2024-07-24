@@ -1,6 +1,6 @@
 # PATH vs. MLE simulations
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 # Benchmarking PATH vs. MLE (varying cell states)
 simPATHvsMLEvarn <- simulate_PATH_MLE_grid(N_set = 1000, 

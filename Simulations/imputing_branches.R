@@ -1,7 +1,7 @@
 # Applying PATH to reconstructed phylogenies
 # with imputed and measured branch lengths
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 # Simulating inference and phylogenetic reconstruction
 Imputed_vs_measured_recon <- simulate_PATH_recon_sets(reps = 100, N_set = 1000, 

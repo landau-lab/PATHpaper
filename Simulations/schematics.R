@@ -1,6 +1,6 @@
 # PATH examples
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 # Simulate heritable, plastic, and three state phylogenies.
 

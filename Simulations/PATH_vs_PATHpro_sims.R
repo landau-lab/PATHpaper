@@ -1,6 +1,6 @@
 # PATH vs. PATHpro inferences on subsampled forward-time simulated phylogenies
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 PATHvProsim <- Reduce("rbind", 
                  lapply(seq(1.2, 2, 0.2), 

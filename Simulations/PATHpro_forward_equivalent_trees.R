@@ -1,6 +1,6 @@
 # Benchmark PATHpro vs. SSE-MLE on forward equivalent simulated phylogenies
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 # Model 1
 dir1 <- "SIM1"
