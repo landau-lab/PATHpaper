@@ -1,6 +1,6 @@
 # GBM analysis
 
-source("PATHpaper_functions.R")
+source("../PATHpaper_functions.R")
 
 # MGH105 location heritability
 MGH105_tree <- phytools::read.newick("MGH105_tree.nwk")
