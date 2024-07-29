@@ -7,12 +7,12 @@ MGH105_tree <- phytools::read.newick("MGH105_tree.nwk")
 MGH105_location <- regmatches(MGH105_tree$tip.label, 
 			      regexpr('MGH105([A-D])', 
 				      MGH105_tree$tip.label)) %>% catMat()
-MGH105_weights <- inv.tree.dist(MGH105_tree, node = TRUE, norm = FALSE)
+MGH105_weights <- inv_tree_dist(MGH105_tree, node = TRUE, norm = FALSE)
 
 # Permute cell locations to estimate phylogenetic auto-correlation sig.
 MGH105_perm_df <- permute_trees(reps = 10^5, z = MGH105_location,
                                 w = MGH105_weights)
-MGH105_obs_df <- tibble(melt(xcor(MGH105_location, MGH105_weights)$Moran, 
+MGH105_obs_df <- tibble(melt(xcor(MGH105_location, MGH105_weights)$phy_cor, 
                              value.name = "obs")) %>% filter(Var1 == Var2)
 
 # GSEA

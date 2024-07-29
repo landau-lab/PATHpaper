@@ -44,17 +44,6 @@ sym <- function(...) {
   return(M)
 }
 
-# Euclidean distance
-euc <- function(x,y) {
-  sqrt(sum((x-y)^2))
-}
-
-CorrectP <- function(P) {
-  Pc <- t(apply(P, 1, function(x) ifelse(x<0, 0, x) ))
-  Pc <- t(apply(Pc, 1, function(x) x/sum(x)))
-  return(Pc)
-}
-
 makeQ <- function(parameters, dimensions) {
   
   parameters <- abs(parameters)
@@ -68,30 +57,6 @@ makeQ <- function(parameters, dimensions) {
   }
   
   return(mat)
-}
-
-# Random Q matrix
-rQ <- function(n, max.r=1) {
-    mat <- matrix(NA, n,n) 
-    for(i in 1:n) {
-        y <- runif(n-1, 0, max.r)
-        mat[i,-i] <- y
-        mat[i,i] <- -sum(y)
-    }
-    return(mat)
-}
-
-normalize <- function(x) {
-  if( length(which(x < 0)) > 0)
-  {
-    stop("\ninput contains negative elements.")
-  }
-  x/sum(x)
-}
-
-rowNorm <- function(W) {
-  s <- rowSums(W)
-  W/ifelse(s==0, 1, s)
 }
 
 # Optimize PATH inf
@@ -161,7 +126,7 @@ simulate_PATH_ideal <- function(i, q_range = 0.5, n_cells = 2^10, n_states = 3) 
   Pinf <- path_run$P
   path.euclid <- sqrt(sum((Pinf-P)^2))
   XC <- xcor(Z, normalize(rowNorm(W$W)))
-  Moran <- XC$Moran
+  Moran <- XC$phy_cor
   MZ <- XC$Z
   minZ <- min(diag(XC$Z), na.rm = TRUE)
   # Format into data frames
@@ -197,7 +162,7 @@ simulate_PATH_vs_MLE <- function(i, q_range, n_cells, n_states, sample_frac,
   time1 <- as.numeric(difftime(s2, s1, units="secs"))
   path.euclid <- sqrt(sum((Pinf-P)^2))
   XC <- xcor(Z, normalize(rowNorm(W$W)))
-  Moran <- XC$Moran
+  Moran <- XC$phy_cor
   MZ <- XC$Z
   minZ <- min(diag(XC$Z), na.rm = TRUE)
   # Format into data frames
@@ -324,7 +289,7 @@ simulate_PATH_recon <- function(i, q_range, n_cells, n_states, sample_frac,
   path_run_imp <- P_inf.zw(Zrecon, Wrecon$W, imputed_pat)
   path.imp.euclid <- euc(P, path_run_imp$P) 
   #
-  MIdist <- euc(XCtrue$Moran, XCrecon$Moran)
+  MIdist <- euc(XCtrue$phy_cor, XCrecon$phy_cor)
   RFdist <- tree_distance(tree, recon.tree, normalized = TRUE, 
                           metric = "RFrooted")
   MPLdist <- tree_distance(tree, recon.tree, normalized = TRUE, 
@@ -406,7 +371,7 @@ gene_autocor <- function(tree, rna_mat) {
     filter(isTip==T) %>% get_tree_data() %>% 
     select(gene_names) %>% as.matrix()
   
-  w <- inv.tree.dist(tree, node = TRUE, norm = FALSE)
+  w <- inv_tree_dist(tree, node = TRUE, norm = FALSE)
   
   PATH:::parM(genes, w) %>% rownames_to_column(var = "gene")
 }
@@ -419,13 +384,13 @@ gene_xcor <- function(tree, rna_mat) {
         filter(isTip==T) %>% get_tree_data() %>% 
         select(gene_names) %>% as.matrix()
     
-    w <- inv.tree.dist(tree, node = TRUE, norm = FALSE)
+    w <- inv_tree_dist(tree, node = TRUE, norm = FALSE)
     
     melt(xcor(genes, w)$Z) %>% as_tibble()
 }
 
 # Gene module xcor
-mod_xcor <- function(tree, mod, weight_function = function(t) exp.tree.dist(t)) {
+mod_xcor <- function(tree, mod, weight_function = function(t) exp_tree_dist(t)) {
   z <- full_join(tree, as.data.frame(mod) %>% 
               rownames_to_column(var = "label"), by = "label") %>% 
       filter(isTip==TRUE) %>% get_tree_data() %>% 
@@ -460,9 +425,8 @@ GBM_PATHpro <- function(tree, mod, depth = 1) {
                    rownames_to_column(var = "label"), by = "label") %>% 
     mutate(state = c("Stem", "Stem", "AC", "MES")[
       max.col(select(., c("NPC", "OPC", "AC", "MES")))]) %>% 
-    filter(isTip==T) %>% get_tree_data() %>% select(state) %>% as.matrix %>%
-    catMat(., state_order = c("Stem", "AC", "MES")) 
-  p <- PATHpro(tree = tree, z = z, depth = depth)
+    filter(isTip==T) %>% get_tree_data() %>% select(state) %>% as.matrix
+  p <- PATHpro(tree = tree, cell_states = z, depth = depth, cell_state_order = c("Stem", "AC", "MES"))
   return(p)
 }
 
@@ -486,7 +450,7 @@ PATH_vs_PATHPro_sim <- function(prolif = c(1,1), Q, N = 10000, n = 1000, death =
   Pinf <- P_inf.zw(z, w, mspd)$P
   
   v1 <- PF_eig(t(diag(prolif-death) + Q))$val
-  Proinf <- PATHpro(tree, z, 3, total_prolif = v1, alpha = NULL,
+  Proinf <- PATHpro(tree, tree$tip.state, 3, total_prolif = v1, alpha = NULL,
 		    guess_list = list(runif(ncol(z)^2, 0, 0.1)))$P
   Ptrue <- expm(Q)
   PATHEuclid <- euc(Ptrue, Pinf)
@@ -528,7 +492,7 @@ SSE_vs_PATHpro_FE <- function(x, P, birth, death, total_prolif = NULL, depth = 3
   N <- length(x$tree$tip.label)
   true_prolif <- birth - death
   s1 <- Sys.time()
-  Pro <- PATHpro(x$tree, x$z, depth, total_prolif = total_prolif, alpha = depth/(n^2 - n))
+  Pro <- PATHpro(x$tree, x$states, depth, total_prolif = total_prolif, alpha = depth/(n^2 - n))
   s2 <- Sys.time()
   Protime <- as.numeric(difftime(s2, s1, units = "secs"))
   Pro_eucP <- euc(P, Pro$P)
@@ -597,7 +561,7 @@ PATHpro.resample <- function(Z, W, mspd,
     Zs <- Z[s,]
     Ws <- W[s,s]
     n <- ncol(Z)
-    PATHpro.ZW(z = Zs, w = Ws, t = mspd, 
+    PATHpro.XW(X = Zs, W = Ws, t = mspd, 
                total_prolif_rate_est = pop_pro,
 	       alpha0 = alph,
                cell_prolifs = NULL)

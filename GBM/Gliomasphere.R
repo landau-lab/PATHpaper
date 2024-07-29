@@ -109,3 +109,4 @@ xcor_from_clonetrees_df <- function(wk_data, tree_direct = "clonetrees/") {
 
 sphere_df <- rbind(xcor_from_clonetrees_df(process_invitro_seurat(no3_path, 3)), 
 		   xcor_from_clonetrees_df(process_invitro_seurat(no4_path, 4)))
+sphere_df <- sphere_df %>% group_by(Var1, Var2) %>% summarize_at(vars(Z), funs(mean))
