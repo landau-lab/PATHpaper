@@ -499,8 +499,9 @@ SSE_vs_PATHpro_FE <- function(x, P, birth, death, total_prolif = NULL, depth = 3
   Pro_eucG <- euc(true_prolif, Pro$gamma)
   
   s3 <- Sys.time()
+  # Setting max_model_runtime = 60 significantly speeds up fit_musse.  
   SSE <- fit_musse(x$tree, n , tip_pstates = x$states, sampling_fractions = rho, 
-                   transition_rate_model = "ARD")
+                   transition_rate_model = "ARD", max_model_runtime = 60)
   s4 <- Sys.time()
   Psse <- expm(SSE$parameters$transition_matrix)
   gsse <- SSE$parameters$birth - SSE$parameters$death
